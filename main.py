@@ -1,10 +1,12 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_pymongo import PyMongo
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 from werkzeug.security import generate_password_hash, check_password_hash
 from google import genai
+import jwt
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -17,7 +19,7 @@ CORS(app, origins="*", supports_credentials=True, allow_headers=["*"], methods=[
 
 # Configure MongoDB
 app.config["MONGO_URI"] = os.getenv("MONGO_URI")
-app.secret_key = os.getenv("SECRET_KEY")
+app.secret_key = os.getenv("SECRET_KEY") or "your-secret-key-here"
 GEMINI_API_KEY = "AIzaSyCE11D_xtWFBn1SvZE4CHRo9_gl17Ue910"
 # Debug if MONGO_URI is missing
 if not app.config["MONGO_URI"]:
@@ -99,8 +101,71 @@ def login():
 
     user = users.find_one({"email": email})
     if user and check_password_hash(user["password"], password):
-        return jsonify({"message": "Login successful"}), 200
+        # Create JWT token
+        token = jwt.encode(
+            {
+                'email': email,
+                'exp': datetime.utcnow() + timedelta(days=7)  # Token expires in 7 days
+            },
+            app.secret_key,
+            algorithm='HS256'
+        )
+        
+        # Create response with user data
+        response = make_response(jsonify({
+            "message": "Login successful",
+            "user": {
+                "email": email,
+                "name": user.get("name"),
+                "studentType": user.get("studentType")
+            }
+        }), 200)
+        
+        # Set HTTP-only cookie
+        response.set_cookie(
+            'auth_token',
+            token,
+            max_age=7*24*60*60,  # 7 days in seconds
+            httponly=True,
+            secure=False,  # Set to True in production with HTTPS
+            samesite='Lax'
+        )
+        
+        return response
     return jsonify({"message": "Invalid credentials"}), 401
+
+# LOGOUT ROUTE
+@app.route("/logout", methods=["POST"])
+def logout():
+    response = make_response(jsonify({"message": "Logged out successfully"}), 200)
+    response.delete_cookie('auth_token')
+    return response
+
+# CHECK AUTH STATUS
+@app.route("/auth/status", methods=["GET"])
+def check_auth():
+    token = request.cookies.get('auth_token')
+    
+    if not token:
+        return jsonify({"authenticated": False}), 401
+    
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+        
+        user = users.find_one({"email": email}, {"_id": 0, "password": 0})
+        if user:
+            return jsonify({
+                "authenticated": True,
+                "user": user
+            }), 200
+        else:
+            return jsonify({"authenticated": False}), 401
+            
+    except jwt.ExpiredSignatureError:
+        return jsonify({"authenticated": False, "message": "Token expired"}), 401
+    except jwt.InvalidTokenError:
+        return jsonify({"authenticated": False, "message": "Invalid token"}), 401
 
 
 @app.route("/user", methods=["GET"])
@@ -162,13 +227,26 @@ def update_user():
 def mental_health_chat():
     data = request.get_json()
     message = data.get("message")
-    email = data.get("email")
-    if not message or not email:
-        return jsonify({"error": "Missing message or email"}), 400
+    
+    if not message:
+        return jsonify({"error": "Missing message"}), 400
+    
+    # Get user email from JWT token in cookies
+    token = request.cookies.get('auth_token')
+    if not token:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid or expired token"}), 401
+    
     # Fetch student details
     user = users.find_one({"email": email}, {"_id": 0, "password": 0})
     if not user:
         return jsonify({"error": "User not found"}), 404
+    
     # Compose prompt for AI
     prompt = f"You are a mental health assistant for students. Here is the student's profile: {user}.\n\nStudent's message: {message}\n\nRespond empathetically and helpfully, considering their background.answer in 50 words. tell your answers in indian context."
     try:
