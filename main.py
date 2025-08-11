@@ -200,22 +200,25 @@ def ai():
 def update_user():
     data = request.get_json()
     email = data.get("email")
-    conclusion = data.get("conclusion")
-    recommendations = data.get("recommendations")
+    update_fields = {}
 
-    if not email:
-        return jsonify({"error": "Missing user email"}), 400
+    # Update basic fields
+    for field in ["conclusion", "recommendations", "quiz_result"]:
+        if field in data:
+            update_fields[field] = data[field]
+
+    # Add other fields as needed...
+
+    if not email or not update_fields:
+        return jsonify({"error": "Missing email or fields to update"}), 400
 
     result = users.update_one(
         {"email": email},
-        {"$set": {
-            "conclusion": conclusion,
-            "recommendations": recommendations
-        }}
+        {"$set": update_fields}
     )
     if result.matched_count:
-        return jsonify({"message": "User data updated"}), 200
-    return jsonify({"message": "User not found"}), 404
+        return jsonify({"message": "User updated"}), 200
+    return jsonify({"error": "User not found"}), 404
 
 @app.route("/user/cgpa", methods=["PATCH"])
 def update_cgpa():
@@ -779,6 +782,43 @@ Format the response as a detailed, actionable study plan that can be saved and f
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/user/quiz-result", methods=["POST"])
+def save_quiz_result():
+    data = request.get_json()
+    email = data.get("email")
+    quiz_result = data.get("quiz_result")
+    if not email or quiz_result is None:
+        return jsonify({"error": "Missing email or quiz_result"}), 400
+    result = users.update_one(
+        {"email": email},
+        {"$set": {"quiz_result": quiz_result}}
+    )
+    if result.matched_count:
+        return jsonify({"message": "Quiz result saved"}), 200
+    return jsonify({"error": "User not found"}), 404
+
+@app.route("/user/quiz-result", methods=["GET"])
+def get_quiz_result():
+    email = request.args.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+    user = users.find_one({"email": email}, {"_id": 0, "quiz_result": 1})
+    if not user or "quiz_result" not in user:
+        return jsonify({"quiz_result": None}), 200
+    return jsonify({"quiz_result": user["quiz_result"]}), 200
+
+@app.route("/user/quiz-result", methods=["DELETE"])
+def delete_quiz_result():
+    email = request.args.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+    result = users.update_one(
+        {"email": email},
+        {"$unset": {"quiz_result": ""}}
+    )
+    if result.matched_count:
+        return jsonify({"message": "Quiz result deleted"}), 200
+    return jsonify({"error": "User not found"}), 404
 
 if __name__ == "__main__":
     app.run(debug=True , port=5001 , host="0.0.0.0")
