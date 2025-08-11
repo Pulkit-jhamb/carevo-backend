@@ -1,3 +1,8 @@
+from datetime import datetime, timedelta
+import uuid
+import random
+import json
+import re
 from flask import Flask, request, jsonify, make_response
 from flask_pymongo import PyMongo
 from flask_cors import CORS
@@ -6,7 +11,6 @@ import os
 from werkzeug.security import generate_password_hash, check_password_hash
 from google import genai
 import jwt
-from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -20,7 +24,7 @@ CORS(app, origins="*", supports_credentials=True, allow_headers=["*"], methods=[
 # Configure MongoDB
 app.config["MONGO_URI"] = os.getenv("MONGO_URI")
 app.secret_key = os.getenv("SECRET_KEY") or "your-secret-key-here"
-GEMINI_API_KEY = "AIzaSyCE11D_xtWFBn1SvZE4CHRo9_gl17Ue910"
+
 # Debug if MONGO_URI is missing
 if not app.config["MONGO_URI"]:
     raise EnvironmentError("MONGO_URI not found. Check your .env file or os.environ.")
@@ -34,6 +38,388 @@ if not mongo:
 
 # Get the "users" collection from the MongoDB database
 users = mongo.db.users  # ✅ Only accessed after Mongo is confirmed working
+
+QUIZ_CACHE_DAYS = int(os.getenv("QUIZ_CACHE_DAYS", "7"))
+TRAITS = ["analytical", "creative", "leadership", "sociable", "structured"]
+
+# --- Enhanced AI Quiz Generation Utilities ---
+
+def call_llm_generate_quiz(student_profile):
+    """Generate personalized quiz questions based on student profile"""
+    try:
+        # Create detailed prompt based on student data
+        student_context = f"""
+        Student Profile:
+        - Name: {student_profile.get('name', 'Student')}
+        - Type: {student_profile.get('studentType', 'Unknown')}
+        - Institute: {student_profile.get('institute', 'Not specified')}
+        - CGPA: {student_profile.get('cgpa', 'Not specified')}
+        - Major/Degree: {student_profile.get('major', 'Not specified')} / {student_profile.get('degree', 'Not specified')}
+        - Year: {student_profile.get('year', 'Not specified')}
+        - Projects: {len(student_profile.get('projects', []))} projects completed
+        - Certifications: {len(student_profile.get('certifications', []))} certifications
+        - Extracurricular: {len(student_profile.get('extracurricularActivities', []))} activities
+        - Subjects: {student_profile.get('subjects', 'Not specified')}
+        """
+        
+        prompt = f"""You are an expert psychometric test designer. Create exactly 30 personalized multiple-choice questions for a student based on their profile.
+
+        {student_context}
+
+        Generate questions that assess these 5 personality traits:
+        1. analytical - logical thinking, problem-solving, data analysis
+        2. creative - imagination, innovation, artistic thinking
+        3. leadership - taking charge, influencing others, decision-making
+        4. sociable - social skills, teamwork, communication
+        5. structured - organization, planning, attention to detail
+
+        Requirements:
+        - Questions should be relevant to the student's academic background and experiences
+        - Each question should have exactly 4 options (A, B, C, D)
+        - Each option should have weights for all 5 traits (0-3 scale)
+        - Questions should cover scenarios relevant to their field of study
+        - Include questions about study habits, career aspirations, problem-solving approaches
+        - Make questions realistic and relatable to Indian students
+
+        Return ONLY a valid JSON array with this exact structure:
+        [
+          {{
+            "id": "q1",
+            "text": "When working on a group project in {student_profile.get('major', 'your field')}, what is your preferred approach?",
+            "options": [
+              {{
+                "id": "A",
+                "text": "Create a detailed project timeline and assign specific tasks",
+                "weights": {{"analytical": 2, "creative": 1, "leadership": 3, "sociable": 2, "structured": 3}}
+              }},
+              {{
+                "id": "B", 
+                "text": "Brainstorm innovative solutions and explore creative possibilities",
+                "weights": {{"analytical": 1, "creative": 3, "leadership": 2, "sociable": 2, "structured": 1}}
+              }},
+              {{
+                "id": "C",
+                "text": "Focus on building team harmony and ensuring everyone contributes",
+                "weights": {{"analytical": 1, "creative": 1, "leadership": 2, "sociable": 3, "structured": 2}}
+              }},
+              {{
+                "id": "D",
+                "text": "Analyze the problem systematically and create logical solutions",
+                "weights": {{"analytical": 3, "creative": 1, "leadership": 2, "sociable": 1, "structured": 2}}
+              }}
+            ]
+          }}
+        ]
+
+        Generate exactly 30 questions following this pattern, ensuring variety and relevance to the student's profile."""
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        
+        # Clean the response text
+        response_text = response.text.strip()
+        
+        # Remove any markdown formatting
+        response_text = re.sub(r'```json\s*', '', response_text)
+        response_text = re.sub(r'```\s*$', '', response_text)
+        
+        # Try to parse the JSON
+        quiz_data = json.loads(response_text)
+        
+        # Validate the structure
+        if not isinstance(quiz_data, list) or len(quiz_data) != 30:
+            print(f"Invalid quiz structure: expected 30 questions, got {len(quiz_data) if isinstance(quiz_data, list) else 'non-list'}")
+            return None
+            
+        # Validate each question
+        for i, question in enumerate(quiz_data):
+            if not all(key in question for key in ['id', 'text', 'options']):
+                print(f"Question {i} missing required fields")
+                return None
+                
+            if len(question['options']) != 4:
+                print(f"Question {i} doesn't have exactly 4 options")
+                return None
+                
+            for j, option in enumerate(question['options']):
+                if not all(key in option for key in ['id', 'text', 'weights']):
+                    print(f"Question {i}, option {j} missing required fields")
+                    return None
+                    
+                weights = option['weights']
+                if not all(trait in weights for trait in TRAITS):
+                    print(f"Question {i}, option {j} missing trait weights")
+                    return None
+        
+        return quiz_data
+        
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error: {e}")
+        return None
+    except Exception as e:
+        print(f"Error generating quiz: {e}")
+        return None
+
+def call_llm_conclusion(student_id, trait_scores):
+    """Generate personalized conclusion based on trait scores and student profile"""
+    try:
+        # Get student profile
+        user = users.find_one({"email": student_id})
+        if not user:
+            return None
+            
+        # Calculate percentages
+        max_possible = 30 * 3  # 30 questions, max 3 points per trait
+        trait_percentages = {trait: (score / max_possible) * 100 for trait, score in trait_scores.items()}
+        
+        student_context = f"""
+        Student Profile:
+        - Name: {user.get('name', 'Student')}
+        - Type: {user.get('studentType', 'Unknown')}
+        - Institute: {user.get('institute', 'Not specified')}
+        - Major/Field: {user.get('major', user.get('class', 'Not specified'))}
+        - CGPA/Performance: {user.get('cgpa', 'Not available')}
+        - Projects: {len(user.get('projects', []))} completed
+        - Certifications: {len(user.get('certifications', []))} obtained
+        - Extracurricular: {len(user.get('extracurricularActivities', []))} activities
+        
+        Psychometric Scores:
+        - Analytical: {trait_scores['analytical']}/{max_possible} ({trait_percentages['analytical']:.1f}%)
+        - Creative: {trait_scores['creative']}/{max_possible} ({trait_percentages['creative']:.1f}%)
+        - Leadership: {trait_scores['leadership']}/{max_possible} ({trait_percentages['leadership']:.1f}%)
+        - Social: {trait_scores['sociable']}/{max_possible} ({trait_percentages['sociable']:.1f}%)
+        - Structured: {trait_scores['structured']}/{max_possible} ({trait_percentages['structured']:.1f}%)
+        """
+        
+        prompt = f"""You are an expert career counselor and psychologist. Analyze this student's psychometric test results and create a comprehensive personality profile and career guidance.
+
+        {student_context}
+
+        Create a detailed analysis that includes:
+
+        1. **Headline**: A catchy, personalized headline describing their personality type
+        2. **Summary**: 2-3 sentences summarizing their core personality traits
+        3. **Top Capabilities**: List their strongest 3-4 capabilities based on highest scores
+        4. **Recommended Career Path**: Specific career recommendations that align with their profile and academic background
+        5. **Strengths**: Detailed explanation of their key strengths
+        6. **Growth Areas**: Areas where they can develop further (lowest scoring traits)
+        7. **Suggested Next Steps**: Specific, actionable steps for career development
+        8. **Confidence Level**: How confident this assessment is based on score patterns
+
+        Consider:
+        - Their academic background and field of study
+        - Current projects and achievements
+        - Balance of technical vs. soft skills
+        - Career opportunities in India
+        - Alignment between personality and chosen field
+
+        Return ONLY a valid JSON object with this structure:
+        {{
+          "headline": "The Strategic Problem-Solver",
+          "summary": "You demonstrate strong analytical thinking combined with leadership potential...",
+          "top_capabilities": ["Strategic Thinking", "Problem Solving", "Team Leadership"],
+          "recommended_path": "Based on your profile, consider roles in...",
+          "strengths": "Your analytical mindset and structured approach...",
+          "growth_areas": ["Creative Expression", "Social Networking"],
+          "suggested_next_steps": [
+            "Develop creative problem-solving skills through design thinking workshops",
+            "Join leadership roles in college clubs or societies",
+            "Build a portfolio showcasing analytical projects"
+          ],
+          "confidence": "high"
+        }}"""
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        
+        # Clean and parse response
+        response_text = response.text.strip()
+        response_text = re.sub(r'```json\s*', '', response_text)
+        response_text = re.sub(r'```\s*$', '', response_text)
+        
+        conclusion_data = json.loads(response_text)
+        
+        # Validate structure
+        required_fields = ['headline', 'summary', 'top_capabilities', 'recommended_path', 'strengths', 'growth_areas', 'suggested_next_steps', 'confidence']
+        if not all(field in conclusion_data for field in required_fields):
+            print("Missing required fields in conclusion")
+            return None
+            
+        return conclusion_data
+        
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error in conclusion: {e}")
+        return None
+    except Exception as e:
+        print(f"Error generating conclusion: {e}")
+        return None
+
+def fallback_generate_quiz(student_profile):
+    """Generate personalized fallback quiz based on student profile"""
+    student_type = student_profile.get('studentType', 'college')
+    major = student_profile.get('major', student_profile.get('class', 'General'))
+    name = student_profile.get('name', 'Student')
+    
+    # Base personalized questions
+    questions_templates = [
+        {
+            "text": f"When studying {major} concepts, what approach works best for you?",
+            "options": [
+                {"text": "Create detailed notes and structured study plans", "weights": {"analytical": 2, "creative": 1, "leadership": 1, "sociable": 1, "structured": 3}},
+                {"text": "Explore creative applications and real-world connections", "weights": {"analytical": 1, "creative": 3, "leadership": 1, "sociable": 1, "structured": 1}},
+                {"text": "Form study groups and discuss concepts with peers", "weights": {"analytical": 1, "creative": 1, "leadership": 2, "sociable": 3, "structured": 1}},
+                {"text": "Analyze problems systematically step by step", "weights": {"analytical": 3, "creative": 1, "leadership": 1, "sociable": 1, "structured": 2}}
+            ]
+        },
+        {
+            "text": f"In your {major} projects, what role do you naturally take?",
+            "options": [
+                {"text": "Project manager ensuring deadlines are met", "weights": {"analytical": 2, "creative": 1, "leadership": 3, "sociable": 2, "structured": 3}},
+                {"text": "Creative innovator bringing new ideas", "weights": {"analytical": 1, "creative": 3, "leadership": 2, "sociable": 1, "structured": 1}},
+                {"text": "Team coordinator facilitating collaboration", "weights": {"analytical": 1, "creative": 1, "leadership": 2, "sociable": 3, "structured": 2}},
+                {"text": "Technical analyst solving complex problems", "weights": {"analytical": 3, "creative": 1, "leadership": 1, "sociable": 1, "structured": 2}}
+            ]
+        }
+    ]
+    
+    # Generate 30 questions with variations
+    quiz = []
+    for i in range(30):
+        template = questions_templates[i % len(questions_templates)]
+        question = {
+            "id": f"q{i+1}",
+            "text": template["text"],
+            "options": [
+                {"id": "A", "text": template["options"][0]["text"], "weights": template["options"][0]["weights"]},
+                {"id": "B", "text": template["options"][1]["text"], "weights": template["options"][1]["weights"]},
+                {"id": "C", "text": template["options"][2]["text"], "weights": template["options"][2]["weights"]},
+                {"id": "D", "text": template["options"][3]["text"], "weights": template["options"][3]["weights"]}
+            ]
+        }
+        quiz.append(question)
+    
+    return quiz
+
+def fallback_conclusion(trait_scores, student_id=None):
+    """Enhanced fallback conclusion with student context"""
+    student_profile = {}
+    if student_id:
+        user = users.find_one({"email": student_id})
+        if user:
+            student_profile = user
+    
+    top_traits = sorted(trait_scores.items(), key=lambda x: -x[1])[:3]
+    student_name = student_profile.get('name', 'Student')
+    major = student_profile.get('major', student_profile.get('class', 'your field'))
+    
+    return {
+        "headline": f"The {top_traits[0][0].title()} {student_profile.get('studentType', 'Student').title()}",
+        "summary": f"Based on your responses, {student_name}, you show strong {top_traits[0][0]} tendencies, making you well-suited for {major} and related fields.",
+        "top_capabilities": [trait.title().replace('_', ' ') for trait, _ in top_traits],
+        "recommended_path": f"Consider career paths that leverage your {top_traits[0][0]} strengths in {major} field, such as research, analysis, or specialized roles.",
+        "strengths": f"Your strongest areas are {', '.join([trait.replace('_', ' ') for trait, _ in top_traits])}, which are valuable in today's competitive landscape.",
+        "growth_areas": [trait.title().replace('_', ' ') for trait, score in trait_scores.items() if score < 15],
+        "suggested_next_steps": [
+            f"Develop your {top_traits[0][0]} skills through relevant projects",
+            f"Explore career opportunities in {major} that match your profile",
+            "Build a portfolio showcasing your strongest capabilities"
+        ],
+        "confidence": "medium"
+    }
+
+# --- Quiz Endpoints ---
+
+@app.route("/quiz/generate", methods=["POST"])
+def generate_quiz():
+    data = request.get_json()
+    student_id = data.get("studentId")
+    user = users.find_one({"email": student_id})
+    if not user:
+        return jsonify({"error": "Student not found"}), 404
+    now = datetime.utcnow()
+    quiz_doc = mongo.db.quizzes.find_one({
+        "studentId": student_id,
+        "expiresAt": {"$gt": now}
+    })
+    if quiz_doc:
+        return jsonify({
+            "quizId": quiz_doc["quizId"],
+            "questions": quiz_doc["questions"]
+        }), 200
+    
+    # Try AI generation first
+    quiz_json = call_llm_generate_quiz(user)
+    if not quiz_json:
+        # Use enhanced fallback
+        quiz_json = fallback_generate_quiz(user)
+    
+    quiz_id = str(uuid.uuid4())
+    mongo.db.quizzes.insert_one({
+        "studentId": student_id,
+        "quizId": quiz_id,
+        "questions": quiz_json,
+        "createdAt": now,
+        "expiresAt": now + timedelta(days=QUIZ_CACHE_DAYS)
+    })
+    return jsonify({
+        "quizId": quiz_id,
+        "questions": quiz_json
+    }), 200
+
+@app.route("/quiz/submit", methods=["POST"])
+def submit_quiz():
+    data = request.get_json()
+    student_id = data.get("studentId")
+    quiz_id = data.get("quizId")
+    answers = data.get("answers")  # {question_id: option_id}
+    quiz_doc = mongo.db.quizzes.find_one({"quizId": quiz_id, "studentId": student_id})
+    if not quiz_doc:
+        return jsonify({"error": "Quiz not found"}), 404
+    
+    trait_scores = {t: 0 for t in TRAITS}
+    for q in quiz_doc["questions"]:
+        qid = q["id"]
+        opt_id = answers.get(qid)
+        opt = next((o for o in q["options"] if o["id"] == opt_id), None)
+        if opt:
+            for t, v in opt["weights"].items():
+                trait_scores[t] += v
+    
+    mongo.db.quiz_answers.insert_one({
+        "studentId": student_id,
+        "quizId": quiz_id,
+        "answers": answers,
+        "submittedAt": datetime.utcnow()
+    })
+    
+    # Try AI conclusion first
+    conclusion_json = call_llm_conclusion(student_id, trait_scores)
+    if not conclusion_json:
+        # Use enhanced fallback
+        conclusion_json = fallback_conclusion(trait_scores, student_id)
+    
+    mongo.db.quiz_results.insert_one({
+        "studentId": student_id,
+        "quizId": quiz_id,
+        "resultJson": conclusion_json,
+        "createdAt": datetime.utcnow()
+    })
+    return jsonify(conclusion_json), 200
+
+@app.route("/quiz/result", methods=["GET"])
+def get_quiz_result():
+    student_id = request.args.get("studentId")
+    result = mongo.db.quiz_results.find_one(
+        {"studentId": student_id},
+        sort=[("createdAt", -1)]
+    )
+    if not result:
+        return jsonify({"error": "No result found"}), 404
+    return jsonify(result["resultJson"]), 200
 
 # SIGNUP ROUTE
 @app.route("/signup", methods=["POST"])
@@ -167,7 +553,6 @@ def check_auth():
     except jwt.InvalidTokenError:
         return jsonify({"authenticated": False, "message": "Invalid token"}), 401
 
-
 @app.route("/user", methods=["GET"])
 def get_user():
     email = request.args.get("email")
@@ -179,7 +564,6 @@ def get_user():
         return jsonify({"message": "User not found"}), 404
 
     return jsonify(user), 200
-
 
 @app.route('/ai', methods=['POST'])
 def ai():
@@ -797,8 +1181,8 @@ def save_quiz_result():
         return jsonify({"message": "Quiz result saved"}), 200
     return jsonify({"error": "User not found"}), 404
 
-@app.route("/user/quiz-result", methods=["GET"])
-def get_quiz_result():
+@app.route("/user/quiz-result/get", methods=["GET"])
+def get_user_quiz_result():
     email = request.args.get("email")
     if not email:
         return jsonify({"error": "Email required"}), 400
