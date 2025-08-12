@@ -3,19 +3,40 @@ import uuid
 import random
 import json
 import re
+import requests
 from flask import Flask, request, jsonify, make_response
 from flask_pymongo import PyMongo
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 from werkzeug.security import generate_password_hash, check_password_hash
-from google import genai
 import jwt
+from mistral_key_manager import get_active_mistral_key
+from mistral_key_manager import get_active_mistral_key
 
+def call_mistral_api(prompt):
+    key = get_active_mistral_key()
+    if not key:
+        raise Exception("No working Mistral API key available.")
+    headers = {"Authorization": f"Bearer {key}"}
+    data = {
+        "model": "mistral-large-latest",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 1024
+    }
+    resp = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=data)
+    resp.raise_for_status()
+    result = resp.json()
+    return result["choices"][0]["message"]["content"]
 # Load environment variables
 load_dotenv()
-GEMINI_API_KEY = "AIzaSyD7rAU5uO8GLPHWa5UroRCsMpOtgWsAH1U" 
-client = genai.Client(api_key=GEMINI_API_KEY)         
+
+# Commented out Gemini remnants
+#GEMINI_API_KEY = "AIzaSyD7rAU5uO8GLPHWa5UroRCsMpOtgWsAH1U" 
+#client = genai.Client(api_key=GEMINI_API_KEY)         
+
 # Create Flask app
 app = Flask(__name__)
 
@@ -113,13 +134,10 @@ def call_llm_generate_quiz(student_profile):
 
         Generate exactly 30 questions following this pattern, ensuring variety and relevance to the student's profile."""
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
+        response = call_mistral_api(prompt)
         
         # Clean the response text
-        response_text = response.text.strip()
+        response_text = response.strip()
         
         # Remove any markdown formatting
         response_text = re.sub(r'```json\s*', '', response_text)
@@ -231,13 +249,10 @@ def call_llm_conclusion(student_id, trait_scores):
           "confidence": "high"
         }}"""
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
+        response = call_mistral_api(prompt)
         
         # Clean and parse response
-        response_text = response.text.strip()
+        response_text = response.strip()
         response_text = re.sub(r'```json\s*', '', response_text)
         response_text = re.sub(r'```\s*$', '', response_text)
         
@@ -572,11 +587,8 @@ def ai():
    if not prompt:
        return jsonify({"error": "No prompt provided"}), 400
    try:
-       response = client.models.generate_content(
-           model="gemini-2.5-flash",
-           contents=prompt,
-       )
-       return jsonify({"response": response.text})
+       plan = call_mistral_api(prompt)
+       return jsonify({"response": plan})
    except Exception as e:
        return jsonify({"error": str(e)}), 500
   
@@ -756,7 +768,6 @@ def academic_planning():
         quiz_doc = mongo.db.quiz_results.find_one({"studentId": email}, sort=[("createdAt", -1)])
         quiz_result = quiz_doc["resultJson"] if quiz_doc else None
 
-    # If either is missing, return a helpful message
     if not user or not quiz_result:
         return jsonify({
             "plan": "Your academic plan cannot be generated until you complete your profile and quiz. Please make sure you have filled out your profile and completed the quiz for a personalized plan."
@@ -783,11 +794,7 @@ def academic_planning():
     """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=plan_prompt,
-        )
-        plan = response.text.strip()
+        plan = call_mistral_api(plan_prompt)
     except Exception as e:
         plan = "Sorry, could not generate a personalized academic plan at this time."
 
@@ -900,10 +907,7 @@ Based on their profile and performance, create a detailed, structured study plan
 Format the response as a detailed, actionable study plan that can be saved and followed. Make it comprehensive and practical for Indian students. Include specific actionable items and detailed strategies."""
 
         try:
-            study_plan_response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=study_plan_prompt,
-            )
+            study_plan_response = call_mistral_api(study_plan_prompt)
             
             prompt = f"""Perfect! I've created a comprehensive study plan for you based on your academic profile and goals.
 
@@ -974,11 +978,15 @@ Make the response detailed, practical, and actionable. Include specific book rec
             prompt = f"You are an academic counselor for Indian students. Here is the student's profile: {user}.\n\nStudent's message: {message}\n\nRespond empathetically and helpfully, considering their background. Provide practical academic and career guidance. Keep response under 100 words and use Indian context."
     
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-        return jsonify({"reply": response.text})
+        # Commented out Gemini call
+        # response = client.models.generate_content(
+        #     model="gemini-2.5-flash",
+        #     contents=prompt,
+        # )
+        # return jsonify({"reply": response.text})
+        
+        reply = call_mistral_api(prompt)
+        return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1042,17 +1050,14 @@ Based on their profile and performance, create a detailed, structured study plan
 Format the response as a detailed, actionable study plan that can be saved and followed. Make it comprehensive and practical for Indian students. Include specific actionable items and detailed strategies."""
 
     try:
-        study_plan_response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=study_plan_prompt,
-        )
+        study_plan_response = call_mistral_api(study_plan_prompt)
         
         # Generate a structured study plan object with comprehensive tasks
         study_plan = {
             "created_at": datetime.now().isoformat(),
             "goals": "Academic improvement and goal achievement",
             "current_performance": current_grades,
-            "plan_content": study_plan_response.text,
+            "plan_content": study_plan_response,
             "tasks": [
                 {
                     "id": "1",
