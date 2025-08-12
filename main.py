@@ -743,100 +743,55 @@ def update_study_plan():
 @app.route("/academic-planning", methods=["POST"])
 def academic_planning():
     data = request.get_json()
-    message = data.get("message")
-    goals = data.get("goals")
-    
-    if not message:
-        return jsonify({"error": "Missing message"}), 400
-    
-    # Get user email from JWT token in cookies
-    token = request.cookies.get('auth_token')
-    if not token:
-        return jsonify({"error": "Authentication required"}), 401
-    
-    try:
-        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
-        email = payload['email']
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-        return jsonify({"error": "Invalid or expired token"}), 401
-    
-    # Fetch student details
+    email = data.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
     user = users.find_one({"email": email}, {"_id": 0, "password": 0})
     if not user:
         return jsonify({"error": "User not found"}), 404
-    
-    # Analyze current academic performance
-    current_grades = {}
-    if user.get("studentType") == "college":
-        if user.get("cgpa"):
-            current_grades["CGPA"] = user["cgpa"]
-    elif user.get("studentType") == "school":
-        if user.get("termData"):
-            current_grades["Term Data"] = user["termData"]
-        if user.get("subjects"):
-            current_grades["Subjects"] = user["subjects"]
-    
-    # Create comprehensive academic planning prompt
-    prompt = f"""You are an expert academic counselor for Indian students. Analyze this student's profile and create a comprehensive study plan.
 
-Student Profile: {user}
-Current Academic Performance: {current_grades}
-Student's Academic Goals: {goals or "Not specified"}
+    quiz_result = user.get("quiz_result")
+    if not quiz_result:
+        quiz_doc = mongo.db.quiz_results.find_one({"studentId": email}, sort=[("createdAt", -1)])
+        quiz_result = quiz_doc["resultJson"] if quiz_doc else None
 
-Based on their current performance and goals, provide:
+    # If either is missing, return a helpful message
+    if not user or not quiz_result:
+        return jsonify({
+            "plan": "Your academic plan cannot be generated until you complete your profile and quiz. Please make sure you have filled out your profile and completed the quiz for a personalized plan."
+        })
 
-1. **Grade Analysis**: Compare current performance with past trends
-2. **Goal Assessment**: Evaluate if their goals are realistic and achievable
-3. **Comprehensive Study Plan**: Create a detailed, structured study plan with:
-   - Weekly study schedule
-   - Subject-wise focus areas
-   - Time management strategies
-   - Study techniques recommendations
-   - Progress tracking methods
-   - Exam preparation timeline
+    plan_prompt = f"""
+    You are an expert academic counselor for Indian students.
+    ONLY use the information provided below. If any information is missing, DO NOT ask the user for it. Generate a concise, actionable, and achievable academic plan for the next 6 months.
 
-Format the response as a structured study plan that can be saved and followed. Keep it practical and actionable for Indian students."""
+    Student Profile:
+    {json.dumps(user, indent=2)}
+
+    Quiz Analysis:
+    {json.dumps(quiz_result, indent=2)}
+
+    The plan should:
+    - Be tailored to the student's strengths, growth areas, and recommended career path from the quiz analysis
+    - Include 3-5 specific, actionable steps for academic improvement
+    - Suggest subject-wise focus areas, time management strategies, and skill development tasks
+    - Be realistic and achievable for a student in their current grade/year
+    - Use clear, encouraging language
+
+    Return only the plan text. Do NOT ask for more information.
+    """
 
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt,
+            contents=plan_prompt,
         )
-        
-        # Generate a structured study plan object
-        study_plan = {
-            "created_at": datetime.now().isoformat(),
-            "goals": goals,
-            "current_performance": current_grades,
-            "plan_content": response.text,
-            "tasks": [
-                {
-                    "id": "1",
-                    "title": "Review current academic performance",
-                    "completed": False,
-                    "category": "analysis"
-                },
-                {
-                    "id": "2", 
-                    "title": "Set specific academic goals",
-                    "completed": False,
-                    "category": "planning"
-                },
-                {
-                    "id": "3",
-                    "title": "Create weekly study schedule",
-                    "completed": False,
-                    "category": "scheduling"
-                }
-            ]
-        }
-        
-        return jsonify({
-            "reply": response.text,
-            "study_plan": study_plan
-        })
+        plan = response.text.strip()
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        plan = "Sorry, could not generate a personalized academic plan at this time."
+
+    return jsonify({"plan": plan})
 
 @app.route("/mental_health_chat", methods=["POST"])
 def mental_health_chat():
@@ -868,29 +823,30 @@ def mental_health_chat():
     if "anxious" in message_lower or "stressed" in message_lower or "worried" in message_lower:
         prompt = f"You are a mental health counselor for Indian students. Here is the student's profile: {user}.\n\nStudent's message: {message}\n\nProvide empathetic support and practical anxiety management techniques. Focus on breathing exercises, time management, and seeking help from college counselors. Keep response under 50 words and use Indian context."
     elif "academic planning" in message_lower or "academic journey" in message_lower or "subjects" in message_lower or "courses" in message_lower:
-        # Enhanced academic planning response
-        current_grades = {}
-        if user.get("studentType") == "college" and user.get("cgpa"):
-            current_grades["CGPA"] = user["cgpa"]
-        elif user.get("studentType") == "school":
-            if user.get("termData"):
-                current_grades["Term Data"] = user["termData"]
-            if user.get("subjects"):
-                current_grades["Subjects"] = user["subjects"]
-        
-        prompt = f"""You are an expert academic counselor for Indian students. Here is the student's profile: {user}
-Current Academic Performance: {current_grades}
+        quiz_result = user.get("quiz_result")
+        if not quiz_result:
+            quiz_doc = mongo.db.quiz_results.find_one({"studentId": email}, sort=[("createdAt", -1)])
+            quiz_result = quiz_doc["resultJson"] if quiz_doc else None
 
-Student's message: {message}
+        prompt = f"""
+        You are an expert academic counselor for Indian students.
+        Based on the student's profile and quiz analysis below, generate a concise academic plan for the next 6 months.
 
-Provide a comprehensive response that:
-1. Analyzes their current academic performance in detail with specific observations
-2. Identifies strengths and areas for improvement
-3. Asks about their specific academic goals and what they want to improve
-4. Offers to create a personalized study plan with detailed strategies
-5. Mentions that you'll create a comprehensive plan with actionable tasks
+        REQUIREMENTS:
+        - The main expert plan should be around 200 words, clear and actionable.
+        - Do NOT include any links or external resources.
+        - After the explanation, provide exactly 5 actionable tasks as a bulleted list, each on a new line starting with '- '.
+        - For any headings or key points, use Markdown bold (**HEADING**) instead of asterisks or all caps.
+        - Use only the information provided below. Do NOT ask the user for more info.
 
-Keep response under 200 words and be encouraging. Ask them to share their specific goals."""
+        STUDENT PROFILE:
+        {json.dumps(user, indent=2)}
+
+        QUIZ ANALYSIS:
+        {json.dumps(quiz_result, indent=2)}
+
+        Return only the plan and the 5 bullet points.
+        """
     elif "goals" in message_lower and ("academic" in message_lower or "study" in message_lower):
         # User is providing their academic goals
         prompt = f"""You are an academic counselor for Indian students. The student has shared their academic goals: {message}
@@ -1116,6 +1072,7 @@ Format the response as a detailed, actionable study plan that can be saved and f
                     "completed": False,
                     "category": "scheduling"
                 },
+               
                 {
                     "id": "4",
                     "title": "Implement recommended study techniques",
@@ -1203,6 +1160,53 @@ def delete_quiz_result():
     if result.matched_count:
         return jsonify({"message": "Quiz result deleted"}), 200
     return jsonify({"error": "User not found"}), 404
+
+@app.route("/user/save-academic-plan", methods=["POST"])
+def save_academic_plan():
+    data = request.get_json()
+    email = data.get("email")
+    academic_plan = data.get("academic_plan")
+    print("Saving plan for:", email)
+    print("Plan:", academic_plan)
+    if not email or not academic_plan:
+        return jsonify({"error": "Missing email or academic plan"}), 400
+
+    result = mongo.db.quiz_results.update_one(
+        {"studentId": email},
+        {"$set": {"accepted_study_plan": academic_plan}},
+        upsert=True
+    )
+    print("Matched count:", result.matched_count, "Upserted id:", result.upserted_id)
+    if result.matched_count or result.upserted_id:
+        return jsonify({"message": "Academic plan saved!"}), 200
+    return jsonify({"error": "User not found"}), 404
+
+@app.route("/user/study-plan", methods=["GET"])
+def get_study_plan():
+    email = request.args.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
+    # Get overall percentage from users database
+    user = mongo.db.users.find_one({"email": email}, {"_id": 0, "termData": 1})
+    overall_percentage = None
+    if user and "termData" in user and user["termData"]:
+        valid_terms = [term for term in user["termData"] if term.get("percentage")]
+        if valid_terms:
+            avg = sum(float(term["percentage"]) for term in valid_terms) / len(valid_terms)
+            overall_percentage = round(avg, 1)
+
+    # Get study plan and tasks from quiz_results database
+    quiz_doc = mongo.db.quiz_results.find_one({"studentId": email}, {"_id": 0, "accepted_study_plan": 1, "tasks": 1})
+    study_plan = quiz_doc.get("accepted_study_plan") if quiz_doc else None
+    tasks = quiz_doc.get("tasks") if quiz_doc and "tasks" in quiz_doc else []
+
+    return jsonify({
+        "overall_percentage": overall_percentage,
+        "study_plan": study_plan,
+        "tasks": tasks
+    })
+
 
 if __name__ == "__main__":
     app.run(debug=True , port=5001 , host="0.0.0.0")
