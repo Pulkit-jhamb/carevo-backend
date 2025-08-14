@@ -12,7 +12,6 @@ import os
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 from mistral_key_manager import get_active_mistral_key
-from mistral_key_manager import get_active_mistral_key
 
 def call_mistral_api(prompt):
     key = get_active_mistral_key()
@@ -828,7 +827,13 @@ def mental_health_chat():
     message_lower = message.lower()
     
     if "anxious" in message_lower or "stressed" in message_lower or "worried" in message_lower:
-        prompt = f"You are a mental health counselor for Indian students. Here is the student's profile: {user}.\n\nStudent's message: {message}\n\nProvide empathetic support and practical anxiety management techniques. Focus on breathing exercises, time management, and seeking help from college counselors. Keep response under 50 words and use Indian context."
+        prompt = (
+            "You are a caring friend talking to an Indian student who feels anxious. "
+            "First, offer gentle consolation in about 100 words, using a friendly and supportive tone. "
+            "Then, ask them kindly to share more about what's making them feel this way. "
+            "Do not give solutions or advice yet. Just listen and show empathy, like a friend would."
+            f"\n\nStudent's message: {message}\nFriend:"
+        )
     elif "academic planning" in message_lower or "academic journey" in message_lower or "subjects" in message_lower or "courses" in message_lower:
         quiz_result = user.get("quiz_result")
         if not quiz_result:
@@ -989,6 +994,28 @@ Make the response detailed, practical, and actionable. Include specific book rec
         return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+def build_anxious_prompt(user_message):
+    return (
+        "You are a caring friend. When someone says they feel anxious, "
+        "first, offer gentle consolation in about 100 words. "
+        "Then, ask them kindly to share more about what's making them feel this way. "
+        "Do not jump to solutions or advice yet. "
+        "Keep your tone friendly and supportive.\n\n"
+        f"User: {user_message}\nFriend:"
+    )
+
+# Use this function when the 'feeling anxious' button is clicked
+# For example, in your endpoint:
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.json
+    user_message = data.get("message")
+    if data.get("emotion") == "anxious":
+        prompt = build_anxious_prompt(user_message)
+    else:
+        prompt = default_prompt(user_message)
+    # ...call LLM with prompt...
 
 @app.route("/save-study-plan", methods=["POST"])
 def save_study_plan():
