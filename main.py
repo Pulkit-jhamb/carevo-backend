@@ -13,6 +13,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 from gemini_key_manager import get_active_gemini_key
 
+
+
+
 def call_gemini_api(prompt):
     API_KEY = get_active_gemini_key()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
@@ -590,19 +593,51 @@ def get_user():
 
     return jsonify(user), 200
 
-# Example for /ai endpoint:
+
+
 @app.route('/ai', methods=['POST'])
 def ai():
-   data = request.get_json()
-   prompt = data.get('prompt')
-   if not prompt:
-       return jsonify({"error": "No prompt provided"}), 400
-   try:
-       # plan = call_mistral_api(prompt)
-       plan = call_gemini_api(prompt)
-       return jsonify({"response": plan})
-   except Exception as e:
-       return jsonify({"error": str(e)}), 500
+    try:
+        # Get JWT from cookies
+        token = request.cookies.get('auth_token')
+        if not token:
+            return jsonify({"error": "No authentication token"}), 401
+
+        # Decode JWT to get email
+        decoded = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = decoded.get('email')
+
+        user = users.find_one({"email": email}, {"_id": 0, "password": 0})
+        res = mongo.db.quiz_results.find_one({"email": email}, {"_id": 0, "password": 0})
+
+        if not email:
+            return jsonify({"error": "Email not found in token"}), 400
+
+        # Get prompt from request
+        data = request.get_json()
+        prompt = data.get('prompt')
+        if not prompt:
+            return jsonify({"error": "No prompt provided"}), 400
+        
+
+        updprompt = f" this is information about the User/the person you are chatting with : {user} and this is the psycometric quiz results : {res} and this is thePrompt: {prompt} answer in 50 words or less"
+
+
+        # Call your AI function
+        plan = call_gemini_api(updprompt)
+
+        # Return both email and response
+        return jsonify({
+            "email": email,
+            "response": plan
+        })
+
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expired"}), 401
+    except jwt.InvalidTokenError:
+        return jsonify({"error": "Invalid token"}), 401
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
   
 @app.route("/user/update", methods=["PATCH"])
 def update_user():
