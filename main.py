@@ -11,24 +11,35 @@ from dotenv import load_dotenv
 import os
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
-from mistral_key_manager import get_active_mistral_key
+from gemini_key_manager import get_active_gemini_key
 
-def call_mistral_api(prompt):
-    key = get_active_mistral_key()
-    if not key:
-        raise Exception("No working Mistral API key available.")
-    headers = {"Authorization": f"Bearer {key}"}
+def call_gemini_api(prompt):
+    API_KEY = get_active_gemini_key()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
+    headers = {"Content-Type": "application/json"}
     data = {
-        "model": "mistral-large-latest",
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "max_tokens": 1024
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ]
     }
-    resp = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=data)
+    resp = requests.post(url, headers=headers, json=data)
     resp.raise_for_status()
     result = resp.json()
-    return result["choices"][0]["message"]["content"]
+    # Parse and format Gemini response
+    text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    return format_gemini_response(text)
+
+def format_gemini_response(text):
+    # Bold section titles (lines ending with ':')
+    text = re.sub(r"^(.*:)", r"**\1**", text, flags=re.MULTILINE)
+    # Bullet points (lines starting with '- ' or '* ')
+    text = re.sub(r"^\s*[-*]\s+", r"• ", text, flags=re.MULTILINE)
+    # Numbered lists (lines starting with '1. ', '2. ', etc.)
+    text = re.sub(r"^\s*\d+\.\s+", lambda m: m.group(0).replace(". ", ". "), text, flags=re.MULTILINE)
+    # Preserve line breaks
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    return text
+
 # Load environment variables
 load_dotenv()
 
@@ -133,7 +144,7 @@ def call_llm_generate_quiz(student_profile):
 
         Generate exactly 30 questions following this pattern, ensuring variety and relevance to the student's profile."""
 
-        response = call_mistral_api(prompt)
+        response = call_gemini_api(prompt)
         
         # Clean the response text
         response_text = response.strip()
@@ -248,7 +259,7 @@ def call_llm_conclusion(student_id, trait_scores):
           "confidence": "high"
         }}"""
 
-        response = call_mistral_api(prompt)
+        response = call_gemini_api(prompt)
         
         # Clean and parse response
         response_text = response.strip()
@@ -579,6 +590,7 @@ def get_user():
 
     return jsonify(user), 200
 
+# Example for /ai endpoint:
 @app.route('/ai', methods=['POST'])
 def ai():
    data = request.get_json()
@@ -586,7 +598,8 @@ def ai():
    if not prompt:
        return jsonify({"error": "No prompt provided"}), 400
    try:
-       plan = call_mistral_api(prompt)
+       # plan = call_mistral_api(prompt)
+       plan = call_gemini_api(prompt)
        return jsonify({"response": plan})
    except Exception as e:
        return jsonify({"error": str(e)}), 500
@@ -793,7 +806,7 @@ def academic_planning():
     """
 
     try:
-        plan = call_mistral_api(plan_prompt)
+        plan = call_gemini_api(plan_prompt)
     except Exception as e:
         plan = "Sorry, could not generate a personalized academic plan at this time."
 
@@ -912,7 +925,7 @@ Based on their profile and performance, create a detailed, structured study plan
 Format the response as a detailed, actionable study plan that can be saved and followed. Make it comprehensive and practical for Indian students. Include specific actionable items and detailed strategies."""
 
         try:
-            study_plan_response = call_mistral_api(study_plan_prompt)
+            study_plan_response = call_gemini_api(study_plan_prompt)
             
             prompt = f"""Perfect! I've created a comprehensive study plan for you based on your academic profile and goals.
 
@@ -983,14 +996,7 @@ Make the response detailed, practical, and actionable. Include specific book rec
             prompt = f"You are an academic counselor for Indian students. Here is the student's profile: {user}.\n\nStudent's message: {message}\n\nRespond empathetically and helpfully, considering their background. Provide practical academic and career guidance. Keep response under 100 words and use Indian context."
     
     try:
-        # Commented out Gemini call
-        # response = client.models.generate_content(
-        #     model="gemini-2.5-flash",
-        #     contents=prompt,
-        # )
-        # return jsonify({"reply": response.text})
-        
-        reply = call_mistral_api(prompt)
+        reply = call_gemini_api(prompt)
         return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1077,7 +1083,7 @@ Based on their profile and performance, create a detailed, structured study plan
 Format the response as a detailed, actionable study plan that can be saved and followed. Make it comprehensive and practical for Indian students. Include specific actionable items and detailed strategies."""
 
     try:
-        study_plan_response = call_mistral_api(study_plan_prompt)
+        study_plan_response = call_gemini_api(study_plan_prompt)
         
         # Generate a structured study plan object with comprehensive tasks
         study_plan = {
