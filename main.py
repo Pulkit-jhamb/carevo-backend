@@ -519,34 +519,25 @@ def login():
         token = jwt.encode(
             {
                 'email': email,
-                'exp': datetime.utcnow() + timedelta(days=7)  # Token expires in 7 days
+                'exp': datetime.utcnow() + timedelta(days=7)
             },
             app.secret_key,
             algorithm='HS256'
         )
         
-        # Create response with user data
-        response = make_response(jsonify({
+        # Return token in response body (NO COOKIES!)
+        return jsonify({
             "message": "Login successful",
+            "token": token,  # 🚨 THIS IS THE KEY CHANGE - send token in response
             "user": {
                 "email": email,
                 "name": user.get("name"),
                 "studentType": user.get("studentType")
             }
-        }), 200)
-        
-        # Set HTTP-only cookie
-        response.set_cookie(
-            'auth_token',
-            token,
-            max_age=7*24*60*60,  # 7 days in seconds
-            httponly=True,
-            secure=False,  # Set to True in production with HTTPS
-            samesite='Lax'
-        )
-        
-        return response
+        }), 200
+    
     return jsonify({"message": "Invalid credentials"}), 401
+
 
 # LOGOUT ROUTE
 @app.route("/logout", methods=["POST"])
@@ -558,10 +549,15 @@ def logout():
 # CHECK AUTH STATUS
 @app.route("/auth/status", methods=["GET"])
 def check_auth():
-    token = request.cookies.get('auth_token')
+    # Look for token in Authorization header first
+    auth_header = request.headers.get('Authorization')
+    token = None
+    
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]  # Get token after "Bearer "
     
     if not token:
-        return jsonify({"authenticated": False}), 401
+        return jsonify({"authenticated": False}), 200
     
     try:
         payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
@@ -574,12 +570,13 @@ def check_auth():
                 "user": user
             }), 200
         else:
-            return jsonify({"authenticated": False}), 401
+            return jsonify({"authenticated": False}), 200
             
     except jwt.ExpiredSignatureError:
-        return jsonify({"authenticated": False, "message": "Token expired"}), 401
+        return jsonify({"authenticated": False, "message": "Token expired"}), 200
     except jwt.InvalidTokenError:
-        return jsonify({"authenticated": False, "message": "Invalid token"}), 401
+        return jsonify({"authenticated": False, "message": "Invalid token"}), 200
+
 
 @app.route("/user", methods=["GET"])
 def get_user():
@@ -594,18 +591,24 @@ def get_user():
     return jsonify(user), 200
 
 
-
 @app.route('/ai', methods=['POST'])
 def ai():
     try:
-        # Get JWT from cookies
-        token = request.cookies.get('auth_token')
-        if not token:
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({"error": "No authentication token"}), 401
-
-        # Decode JWT to get email
-        decoded = jwt.decode(token, app.secret_key, algorithms=['HS256'])
-        email = decoded.get('email')
+        
+        token = auth_header.split(' ')[1]
+        
+        # Decode token to get email
+        try:
+            decoded = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+            email = decoded.get('email')
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token"}), 401
 
         user = users.find_one({"email": email}, {"_id": 0, "password": 0})
         res = mongo.db.quiz_results.find_one({"email": email}, {"_id": 0, "password": 0})
@@ -618,24 +621,17 @@ def ai():
         prompt = data.get('prompt')
         if not prompt:
             return jsonify({"error": "No prompt provided"}), 400
-        
 
         updprompt = f" this is information about the User/the person you are chatting with : {user} and this is the psycometric quiz results : {res} and this is thePrompt: {prompt} answer in 50 words or less"
-
 
         # Call your AI function
         plan = call_gemini_api(updprompt)
 
-        # Return both email and response
         return jsonify({
             "email": email,
             "response": plan
         })
 
-    except jwt.ExpiredSignatureError:
-        return jsonify({"error": "Token expired"}), 401
-    except jwt.InvalidTokenError:
-        return jsonify({"error": "Invalid token"}), 401
     except Exception as e:
         return jsonify({"error": str(e)}), 500
   
