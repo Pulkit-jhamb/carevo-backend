@@ -542,9 +542,11 @@ def login():
 # LOGOUT ROUTE
 @app.route("/logout", methods=["POST"])
 def logout():
-    response = make_response(jsonify({"message": "Logged out successfully"}), 200)
-    response.delete_cookie('auth_token')
-    return response
+    # For JWT-based auth, logout is handled client-side by removing the token
+    # Server-side logout would require token blacklisting (optional enhancement)
+    return jsonify({"message": "Logged out successfully"}), 200
+
+
 
 # CHECK AUTH STATUS
 @app.route("/auth/status", methods=["GET"])
