@@ -25,7 +25,8 @@ def call_gemini_api(prompt):
             {"parts": [{"text": prompt}]}
         ]
     }
-    resp = requests.post(url, headers=headers, json=data)
+    # Increased timeout and will wait for LLM response
+    resp = requests.post(url, headers=headers, json=data, timeout=120)
     resp.raise_for_status()
     result = resp.json()
     # Parse and format Gemini response
@@ -379,11 +380,8 @@ def generate_quiz():
             "questions": quiz_doc["questions"]
         }), 200
     
-    # Try AI generation first
+    # Generate quiz using LLM - wait for completion, no fallback
     quiz_json = call_llm_generate_quiz(user)
-    if not quiz_json:
-        # Use enhanced fallback
-        quiz_json = fallback_generate_quiz(user)
     
     quiz_id = str(uuid.uuid4())
     mongo.db.quizzes.insert_one({
