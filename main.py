@@ -157,6 +157,10 @@ def call_llm_generate_quiz(student_profile):
         response_text = re.sub(r'```json\s*', '', response_text)
         response_text = re.sub(r'```\s*$', '', response_text)
         
+        # Debug logging
+        print(f"Raw Gemini response length: {len(response_text)}")
+        print(f"First 200 chars: {response_text[:200]}")
+        
         # Try to parse the JSON
         quiz_data = json.loads(response_text)
         
@@ -380,8 +384,17 @@ def generate_quiz():
             "questions": quiz_doc["questions"]
         }), 200
     
-    # Generate quiz using LLM - wait for completion, no fallback
+    # Generate quiz using LLM with fallback
     quiz_json = call_llm_generate_quiz(user)
+    
+    # If LLM generation fails, use fallback
+    if not quiz_json:
+        print(f"LLM quiz generation failed for {student_id}, using fallback")
+        quiz_json = fallback_generate_quiz(user)
+    
+    # Final validation - ensure we have questions
+    if not quiz_json or not isinstance(quiz_json, list) or len(quiz_json) == 0:
+        return jsonify({"error": "Failed to generate quiz questions"}), 500
     
     quiz_id = str(uuid.uuid4())
     mongo.db.quizzes.insert_one({
