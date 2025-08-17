@@ -13,25 +13,68 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 from gemini_key_manager import get_active_gemini_key
 
+import time
 
+def call_gemini_api_with_retry(prompt, max_retries=3):
+    """Call Gemini API with retry mechanism"""
+    for attempt in range(max_retries):
+        try:
+            result = call_gemini_api(prompt)
+            if result:
+                return result
+            print(f"Attempt {attempt + 1} failed, retrying...")
+            time.sleep(2)  # Wait 2 seconds before retry
+        except Exception as e:
+            print(f"Attempt {attempt + 1} error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                raise e
+    return None
 
 
 def call_gemini_api(prompt):
-    API_KEY = get_active_gemini_key()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
-    headers = {"Content-Type": "application/json"}
-    data = {
-        "contents": [
-            {"parts": [{"text": prompt}]}
-        ]
-    }
-    # Increased timeout and will wait for LLM response
-    resp = requests.post(url, headers=headers, json=data, timeout=120)
-    resp.raise_for_status()
-    result = resp.json()
-    # Parse and format Gemini response
-    text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-    return format_gemini_response(text)
+    try:
+        API_KEY = get_active_gemini_key()
+        if not API_KEY: 
+            print("ERROR: No Gemini API key available")
+            return None
+            
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
+        headers = {"Content-Type": "application/json"}
+        data = {
+            "contents": [
+                {"parts": [{"text": prompt}]}
+            ]
+        }
+        
+        print(f"Making Gemini API call to: {url[:50]}...")
+        resp = requests.post(url, headers=headers, json=data, timeout=120)
+        
+        print(f"Gemini API response status: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            print(f"Gemini API error: {resp.text}")
+            return None
+            
+        result = resp.json()
+        
+        # Check if response has the expected structure
+        if "candidates" not in result or not result["candidates"]:
+            print(f"Unexpected Gemini response structure: {result}")
+            return None
+            
+        text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        
+        if not text:
+            print("Empty text response from Gemini API")
+            return None
+            
+        return text
+        
+    except Exception as e:
+        print(f"Exception in call_gemini_api: {str(e)}")
+        return None
 
 def format_gemini_response(text):
     # Bold section titles (lines ending with ':')
@@ -80,119 +123,90 @@ TRAITS = ["analytical", "creative", "leadership", "sociable", "structured"]
 # --- Enhanced AI Quiz Generation Utilities ---
 
 def call_llm_generate_quiz(student_profile):
-    """Generate personalized quiz questions based on student profile"""
+    """Generate personalized quiz questions based on student profile, with reference quiz support and relaxed length check"""
     try:
-        # Create detailed prompt based on student data
-        student_context = f"""
-        Student Profile:
-        - Name: {student_profile.get('name', 'Student')}
-        - Type: {student_profile.get('studentType', 'Unknown')}
-        - Institute: {student_profile.get('institute', 'Not specified')}
-        - CGPA: {student_profile.get('cgpa', 'Not specified')}
-        - Major/Degree: {student_profile.get('major', 'Not specified')} / {student_profile.get('degree', 'Not specified')}
-        - Year: {student_profile.get('year', 'Not specified')}
-        - Projects: {len(student_profile.get('projects', []))} projects completed
-        - Certifications: {len(student_profile.get('certifications', []))} certifications
-        - Extracurricular: {len(student_profile.get('extracurricularActivities', []))} activities
-        - Subjects: {student_profile.get('subjects', 'Not specified')}
-        """
-        
-        prompt = f"""You are an expert psychometric test designer. Create exactly 30 personalized multiple-choice questions for a student based on their profile.
+        major = student_profile.get('major', student_profile.get('class', 'General'))
 
-        {student_context}
+        # --- Reference Quiz Retrieval ---
+        reference_quiz_doc = mongo.db.quizzes.find_one({"studentId": "pulkitjhamb@gmail.com"}, sort=[("createdAt", -1)])
+        reference_quiz = reference_quiz_doc["questions"] if reference_quiz_doc and "questions" in reference_quiz_doc else None
 
-        Generate questions that assess these 5 personality traits:
-        1. analytical - logical thinking, problem-solving, data analysis
-        2. creative - imagination, innovation, artistic thinking
-        3. leadership - taking charge, influencing others, decision-making
-        4. sociable - social skills, teamwork, communication
-        5. structured - organization, planning, attention to detail
+        # --- Prompt Construction ---
+        prompt = f"""Generate a psychometric quiz for a {major} student. 
+Return ONLY a JSON array with this exact structure:
 
-        Requirements:
-        - Questions should be relevant to the student's academic background and experiences
-        - Each question should have exactly 4 options (A, B, C, D)
-        - Each option should have weights for all 5 traits (0-3 scale)
-        - Questions should cover scenarios relevant to their field of study
-        - Include questions about study habits, career aspirations, problem-solving approaches
-        - Make questions realistic and relatable to Indian students
+[
+  {{
+    "id": "q1",
+    "text": "When working on {major} projects, what motivates you most?",
+    "options": [
+      {{"id": "A", "text": "Achieving perfect results", "weights": {{"analytical": 3, "creative": 1, "leadership": 1, "sociable": 1, "structured": 3}}}},
+      {{"id": "B", "text": "Finding creative solutions", "weights": {{"analytical": 1, "creative": 3, "leadership": 1, "sociable": 1, "structured": 1}}}},
+      {{"id": "C", "text": "Leading team discussions", "weights": {{"analytical": 1, "creative": 1, "leadership": 3, "sociable": 2, "structured": 1}}}},
+      {{"id": "D", "text": "Collaborating with others", "weights": {{"analytical": 1, "creative": 1, "leadership": 1, "sociable": 3, "structured": 1}}}}
+    ]
+  }}
+  // ... more questions ...
+]
 
-        Return ONLY a valid JSON array with this exact structure:
-        [
-          {{
-            "id": "q1",
-            "text": "When working on a group project in {student_profile.get('major', 'your field')}, what is your preferred approach?",
-            "options": [
-              {{
-                "id": "A",
-                "text": "Create a detailed project timeline and assign specific tasks",
-                "weights": {{"analytical": 2, "creative": 1, "leadership": 3, "sociable": 2, "structured": 3}}
-              }},
-              {{
-                "id": "B", 
-                "text": "Brainstorm innovative solutions and explore creative possibilities",
-                "weights": {{"analytical": 1, "creative": 3, "leadership": 2, "sociable": 2, "structured": 1}}
-              }},
-              {{
-                "id": "C",
-                "text": "Focus on building team harmony and ensuring everyone contributes",
-                "weights": {{"analytical": 1, "creative": 1, "leadership": 2, "sociable": 3, "structured": 2}}
-              }},
-              {{
-                "id": "D",
-                "text": "Analyze the problem systematically and create logical solutions",
-                "weights": {{"analytical": 3, "creative": 1, "leadership": 2, "sociable": 1, "structured": 2}}
-              }}
-            ]
-          }}
-        ]
+CRITICAL REQUIREMENTS:
+- Return ONLY the JSON array starting with [ and ending with ]
+- Use question ids q1, q2, q3... up to qN (N between 25 and 30)
+- Each option must have weights for all 5 traits: analytical, creative, leadership, sociable, structured
+- Weight values must be integers 0-3
+- Questions should be relevant to {major} field
+- NO markdown formatting, NO explanations, ONLY the JSON array
 
-        Generate exactly 30 questions following this pattern, ensuring variety and relevance to the student's profile."""
-
+Reference Quiz Example (for inspiration, do NOT copy directly):
+{json.dumps(reference_quiz, indent=2) if reference_quiz else "No reference quiz available."}
+"""
         response = call_gemini_api(prompt)
-        
-        # Clean the response text
+        if not response:
+            print("No response from Gemini API")
+            return None
+
         response_text = response.strip()
-        
-        # Remove any markdown formatting
-        response_text = re.sub(r'```json\s*', '', response_text)
-        response_text = re.sub(r'```\s*$', '', response_text)
-        
-        # Debug logging
-        print(f"Raw Gemini response length: {len(response_text)}")
-        print(f"First 200 chars: {response_text[:200]}")
-        
+        print(f"RAW GEMINI RESPONSE:\nLength: {len(response_text)}\nFull response: {response_text}\n{'='*50}")
+
+        # Extract JSON array
+        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
+        else:
+            start_idx = response_text.find('[')
+            end_idx = response_text.rfind(']')
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                response_text = response_text[start_idx:end_idx+1]
+            else:
+                print("Could not extract JSON array from Gemini response")
+                return None
+        response_text = response_text.strip()
+
+        print(f"CLEANED RESPONSE:\nLength: {len(response_text)}\nContent: {response_text}\n{'='*50}")
+
         # Try to parse the JSON
         quiz_data = json.loads(response_text)
-        
-        # Validate the structure
-        if not isinstance(quiz_data, list) or len(quiz_data) != 30:
-            print(f"Invalid quiz structure: expected 30 questions, got {len(quiz_data) if isinstance(quiz_data, list) else 'non-list'}")
+
+        # Relaxed validation: accept 25-30 questions
+        if not isinstance(quiz_data, list):
+            print(f"Response is not a list: {type(quiz_data)}")
             return None
-            
-        # Validate each question
-        for i, question in enumerate(quiz_data):
-            if not all(key in question for key in ['id', 'text', 'options']):
-                print(f"Question {i} missing required fields")
-                return None
-                
-            if len(question['options']) != 4:
-                print(f"Question {i} doesn't have exactly 4 options")
-                return None
-                
-            for j, option in enumerate(question['options']):
-                if not all(key in option for key in ['id', 'text', 'weights']):
-                    print(f"Question {i}, option {j} missing required fields")
-                    return None
-                    
-                weights = option['weights']
-                if not all(trait in weights for trait in TRAITS):
-                    print(f"Question {i}, option {j} missing trait weights")
-                    return None
-        
-        return quiz_data
-        
+
+        if not (25 <= len(quiz_data) <= 30):
+            print(f"Expected 25-30 questions, got {len(quiz_data)}")
+            return None
+
+        # Quick validation of first question structure
+        if quiz_data and 'id' in quiz_data[0] and 'text' in quiz_data[0] and 'options' in quiz_data[0]:
+            print("Quiz structure looks valid")
+            return quiz_data
+        else:
+            print("Invalid quiz structure")
+            return None
+
     except json.JSONDecodeError as e:
         print(f"JSON parsing error: {e}")
+        print(f"Problematic text: {response_text[:200] if 'response_text' in locals() else 'No response text'}")
         return None
     except Exception as e:
         print(f"Error generating quiz: {e}")
@@ -210,16 +224,24 @@ def call_llm_conclusion(student_id, trait_scores):
         max_possible = 30 * 3  # 30 questions, max 3 points per trait
         trait_percentages = {trait: (score / max_possible) * 100 for trait, score in trait_scores.items()}
         
+        grade_class = user.get('class', 'Not specified')
+        
+        # Convert Roman numerals to understand school grade level
+        grade_mapping = {'IX': '9th grade', 'X': '10th grade', 'XI': '11th grade', 'XII': '12th grade'}
+        readable_grade = grade_mapping.get(grade_class, grade_class)
+        
         student_context = f"""
         Student Profile:
         - Name: {user.get('name', 'Student')}
-        - Type: {user.get('studentType', 'Unknown')}
-        - Institute: {user.get('institute', 'Not specified')}
-        - Major/Field: {user.get('major', user.get('class', 'Not specified'))}
-        - CGPA/Performance: {user.get('cgpa', 'Not available')}
-        - Projects: {len(user.get('projects', []))} completed
-        - Certifications: {len(user.get('certifications', []))} obtained
+        - Current School Grade: {readable_grade} (Class {grade_class} - Indian secondary school student)
+        - School/Institute: {user.get('institute', 'Not specified')}
+        - Stream/Subjects: {user.get('major', user.get('class', 'General'))}
+        - Academic Performance: {user.get('academicPerformance', 'Not specified')}
+        - Career Interests: {', '.join(user.get('careerInterests', ['Exploring options']))}
+        - Skills: {', '.join(user.get('skills', ['Developing']))}
         - Extracurricular: {len(user.get('extracurricularActivities', []))} activities
+        
+        IMPORTANT: This student is in {readable_grade} of Indian secondary school (ages 14-18). They are NOT in college.
         
         Psychometric Scores:
         - Analytical: {trait_scores['analytical']}/{max_possible} ({trait_percentages['analytical']:.1f}%)
@@ -229,140 +251,172 @@ def call_llm_conclusion(student_id, trait_scores):
         - Structured: {trait_scores['structured']}/{max_possible} ({trait_percentages['structured']:.1f}%)
         """
         
-        prompt = f"""You are an expert career counselor and psychologist. Analyze this student's psychometric test results and create a comprehensive personality profile and career guidance.
+        # Adjust analysis based on student type
+        if user.get('studentType') == 'school':
+            prompt = f"""You are a school career counselor talking to a {readable_grade} student in Indian secondary school. This is a SCHOOL STUDENT, NOT a college student. Give ONLY school-appropriate advice.
 
-        {student_context}
+            {student_context}
 
-        Create a detailed analysis that includes:
+            STRICT RULES:
+            - NO company names (Google, Microsoft, TCS, etc.)
+            - NO professional terms (internships, networking, GitHub, IEEE, professional societies)
+            - NO salary packages or LPA mentions
+            - NO college-level activities
+            - ONLY things a school student can do THIS ACADEMIC YEAR
+            - Focus on CAREER PATHS not job packages
 
-        1. **Headline**: A catchy, personalized headline describing their personality type
-        2. **Summary**: 2-3 sentences summarizing their core personality traits
-        3. **Top Capabilities**: List their strongest 3-4 capabilities based on highest scores
-        4. **Recommended Career Path**: Specific career recommendations that align with their profile and academic background
-        5. **Strengths**: Detailed explanation of their key strengths
-        6. **Growth Areas**: Areas where they can develop further (lowest scoring traits)
-        7. **Suggested Next Steps**: Specific, actionable steps for career development
-        8. **Confidence Level**: How confident this assessment is based on score patterns
+            Create analysis for this school student THIS IS A SCHOOL STUDENT DO NOT MENTION ANYTHING ABOVE THE COMPREHENSION LEVEL OF A NORMAL 14-17 YEAR OLD INDIAN STUDENT:
 
-        Consider:
-        - Their academic background and field of study
-        - Current projects and achievements
-        - Balance of technical vs. soft skills
-        - Career opportunities in India
-        - Alignment between personality and chosen field
+            1. **Headline**: Cool personality title for a teenager
+            
+            2. **Summary**: 4-5 sentences about their personality and school strengths
+            
+            3. **Top Capabilities**: 4-5 strengths for school subjects and activities
+            
+            4. **Recommended Career Path**: Suggest career FIELDS to explore:
+               - Career paths like: doctor, teacher, artist, content creator, scientist, engineer, writer, designer, etc.
+               - Which school stream (Science/Commerce/Arts) fits them
+               - Modern careers like YouTuber, app developer, environmental activist
+               - Skills to develop in school
+               - Types of higher education after 12th
+               - DO NOT MENTION ANY COMPANY NAMES OR PACKAGES
+            
+            5. **Strengths**: How their strengths help in current school grade
+            
+            6. **Growth Areas**: 2-3 areas to improve with school-level tips
+            
+            7. **Suggested Next Steps**: 6-8 steps for THIS SCHOOL YEAR ONLY:
+               - Subject choices for next class
+               - School clubs to join (debate, drama, science, art clubs)
+               - Skills to learn online (coding basics, art, languages)
+               - School competitions (science fair, essay writing, sports)
+               - Career exploration (talk to teachers, online research, career day)
+               - Study habits and academic planning
+               - Personal development activities
+               - DO NOT MENTION COLLEGE LEVEL STUFF LIKE SOCIETIES IEEE NPTEL OR ANYTHING JUST NORMAL INDIAN SCHOOL CLUBS AND ACTIVITIES
+            
+            8. **Confidence Level**: "high"
 
-        Return ONLY a valid JSON object with this structure:
-        {{
-          "headline": "The Strategic Problem-Solver",
-          "summary": "You demonstrate strong analytical thinking combined with leadership potential...",
-          "top_capabilities": ["Strategic Thinking", "Problem Solving", "Team Leadership"],
-          "recommended_path": "Based on your profile, consider roles in...",
-          "strengths": "Your analytical mindset and structured approach...",
-          "growth_areas": ["Creative Expression", "Social Networking"],
-          "suggested_next_steps": [
-            "Develop creative problem-solving skills through design thinking workshops",
-            "Join leadership roles in college clubs or societies",
-            "Build a portfolio showcasing analytical projects"
-          ],
-          "confidence": "high"
-        }}"""
+            Remember: This is a SCHOOL STUDENT. No professional or college activities. Only school-level suggestions.
+
+            Return ONLY valid JSON:
+            {{
+              "headline": "The [Teen Title]",
+              "summary": "School-focused personality analysis...",
+              "top_capabilities": ["School strength 1", "Academic skill 2", "Personal ability 3", "Future skill 4"],
+              "recommended_path": "Career fields exploration with stream guidance - NO company names...",
+              "strengths": "How strengths help in current school grade...",
+              "growth_areas": ["School improvement area 1", "Academic development area 2"],
+              "suggested_next_steps": [
+                "Subject choice for next year",
+                "School club to join",
+                "Online skill to learn",
+                "School competition to enter",
+                "Career exploration activity",
+                "Study planning step"
+              ],
+              "confidence": "high"
+            }}"""
+        else:
+            prompt = f"""You are an expert career counselor and psychologist with 15+ years of experience in Indian education and career development. Analyze this student's comprehensive psychometric test results and create an in-depth, personalized career profile.
+
+            {student_context}
+
+            Create a detailed, comprehensive analysis with rich content:
+
+            1. **Headline**: Create a unique, inspiring personality archetype title (e.g., "The Strategic Innovator", "The Analytical Leader")
+            
+            2. **Summary**: Write 4-5 detailed sentences explaining their core personality, learning style, and natural tendencies. Make it personal and insightful.
+            
+            3. **Top Capabilities**: List 4-5 specific, detailed capabilities with explanations of how they manifest in academic and professional settings.
+            
+            4. **Recommended Career Path**: Provide 3-4 specific career paths with:
+               - Exact job titles and roles
+               - Industry sectors in India with growth potential
+               - Salary expectations and career progression
+               - Required skills and qualifications
+               - Companies/organizations to target
+            
+            5. **Strengths**: Write 3-4 paragraphs detailing their key strengths with specific examples of how these apply to their field of study and future career.
+            
+            6. **Growth Areas**: Identify 2-3 areas for development with specific strategies for improvement.
+            
+            7. **Suggested Next Steps**: Provide 6-8 highly specific, actionable steps including:
+               - Specific courses, certifications, or skills to develop
+               - Networking strategies and professional associations to join
+               - Projects or internships to pursue
+               - Books, resources, or mentors to seek
+               - Timeline for each step (next 6 months, 1 year, 2 years)
+            
+            8. **Confidence Level**: Always set to "high" - provide confident, decisive guidance
+
+            Make the analysis deeply personalized using their name, field of study, academic performance, and specific background. Reference Indian job market trends, educational institutions, and career opportunities. Be specific, actionable, and inspiring.
+
+            Return ONLY a valid JSON object with comprehensive content:
+            {{
+              "headline": "The [Unique Archetype Title]",
+              "summary": "Detailed 4-5 sentence personal analysis...",
+              "top_capabilities": ["Detailed Capability 1 with context", "Detailed Capability 2 with context", "Detailed Capability 3 with context", "Detailed Capability 4 with context"],
+              "recommended_path": "Comprehensive career guidance with specific paths, companies, salaries, and progression...",
+              "strengths": "Multiple detailed paragraphs explaining key strengths with examples...",
+              "growth_areas": ["Specific Area 1 with improvement strategy", "Specific Area 2 with improvement strategy"],
+              "suggested_next_steps": [
+                "Specific actionable step 1 with timeline",
+                "Specific actionable step 2 with timeline",
+                "Specific actionable step 3 with timeline",
+                "Specific actionable step 4 with timeline",
+                "Specific actionable step 5 with timeline",
+                "Specific actionable step 6 with timeline"
+              ],
+              "confidence": "high"
+            }}"""
 
         response = call_gemini_api(prompt)
+        
+        
+        # Debug: Check if we got a response at all
+        if not response:
+            print("ERROR: No response from Gemini API in call_llm_conclusion")
+            return None
+        
+        print(f"DEBUG: Raw Gemini response length: {len(response)}")
+        print(f"DEBUG: Raw Gemini response: {response[:500]}...")
         
         # Clean and parse response
         response_text = response.strip()
         response_text = re.sub(r'```json\s*', '', response_text)
         response_text = re.sub(r'```\s*$', '', response_text)
         
-        conclusion_data = json.loads(response_text)
+        print(f"DEBUG: Cleaned response length: {len(response_text)}")
+        print(f"DEBUG: Cleaned response: {response_text[:500]}...")
+        
+        try:
+            conclusion_data = json.loads(response_text)
+            print(f"DEBUG: Successfully parsed JSON with keys: {list(conclusion_data.keys())}")
+        except json.JSONDecodeError as e:
+            print(f"ERROR: JSON parsing failed: {e}")
+            print(f"ERROR: Problematic text: {response_text[:1000]}")
+            return None
         
         # Validate structure
         required_fields = ['headline', 'summary', 'top_capabilities', 'recommended_path', 'strengths', 'growth_areas', 'suggested_next_steps', 'confidence']
-        if not all(field in conclusion_data for field in required_fields):
-            print("Missing required fields in conclusion")
+        missing_fields = [field for field in required_fields if field not in conclusion_data]
+        if missing_fields:
+            print(f"ERROR: Missing required fields in conclusion: {missing_fields}")
+            print(f"ERROR: Available fields: {list(conclusion_data.keys())}")
             return None
-            
+        
+        print("SUCCESS: AI conclusion generated successfully")
         return conclusion_data
         
     except json.JSONDecodeError as e:
-        print(f"JSON parsing error in conclusion: {e}")
+        print(f"ERROR: JSON parsing error in conclusion: {e}")
+        print(f"ERROR: Response text: {response_text if 'response_text' in locals() else 'No response text'}")
         return None
     except Exception as e:
-        print(f"Error generating conclusion: {e}")
+        print(f"ERROR: Exception in call_llm_conclusion: {e}")
+        print(f"ERROR: Response: {response if 'response' in locals() else 'No response'}")
         return None
-
-def fallback_generate_quiz(student_profile):
-    """Generate personalized fallback quiz based on student profile"""
-    student_type = student_profile.get('studentType', 'college')
-    major = student_profile.get('major', student_profile.get('class', 'General'))
-    name = student_profile.get('name', 'Student')
-    
-    # Base personalized questions
-    questions_templates = [
-        {
-            "text": f"When studying {major} concepts, what approach works best for you?",
-            "options": [
-                {"text": "Create detailed notes and structured study plans", "weights": {"analytical": 2, "creative": 1, "leadership": 1, "sociable": 1, "structured": 3}},
-                {"text": "Explore creative applications and real-world connections", "weights": {"analytical": 1, "creative": 3, "leadership": 1, "sociable": 1, "structured": 1}},
-                {"text": "Form study groups and discuss concepts with peers", "weights": {"analytical": 1, "creative": 1, "leadership": 2, "sociable": 3, "structured": 1}},
-                {"text": "Analyze problems systematically step by step", "weights": {"analytical": 3, "creative": 1, "leadership": 1, "sociable": 1, "structured": 2}}
-            ]
-        },
-        {
-            "text": f"In your {major} projects, what role do you naturally take?",
-            "options": [
-                {"text": "Project manager ensuring deadlines are met", "weights": {"analytical": 2, "creative": 1, "leadership": 3, "sociable": 2, "structured": 3}},
-                {"text": "Creative innovator bringing new ideas", "weights": {"analytical": 1, "creative": 3, "leadership": 2, "sociable": 1, "structured": 1}},
-                {"text": "Team coordinator facilitating collaboration", "weights": {"analytical": 1, "creative": 1, "leadership": 2, "sociable": 3, "structured": 2}},
-                {"text": "Technical analyst solving complex problems", "weights": {"analytical": 3, "creative": 1, "leadership": 1, "sociable": 1, "structured": 2}}
-            ]
-        }
-    ]
-    
-    # Generate 30 questions with variations
-    quiz = []
-    for i in range(30):
-        template = questions_templates[i % len(questions_templates)]
-        question = {
-            "id": f"q{i+1}",
-            "text": template["text"],
-            "options": [
-                {"id": "A", "text": template["options"][0]["text"], "weights": template["options"][0]["weights"]},
-                {"id": "B", "text": template["options"][1]["text"], "weights": template["options"][1]["weights"]},
-                {"id": "C", "text": template["options"][2]["text"], "weights": template["options"][2]["weights"]},
-                {"id": "D", "text": template["options"][3]["text"], "weights": template["options"][3]["weights"]}
-            ]
-        }
-        quiz.append(question)
-    
-    return quiz
-
-def fallback_conclusion(trait_scores, student_id=None):
-    """Enhanced fallback conclusion with student context"""
-    student_profile = {}
-    if student_id:
-        user = users.find_one({"email": student_id})
-        if user:
-            student_profile = user
-    
-    top_traits = sorted(trait_scores.items(), key=lambda x: -x[1])[:3]
-    student_name = student_profile.get('name', 'Student')
-    major = student_profile.get('major', student_profile.get('class', 'your field'))
-    
-    return {
-        "headline": f"The {top_traits[0][0].title()} {student_profile.get('studentType', 'Student').title()}",
-        "summary": f"Based on your responses, {student_name}, you show strong {top_traits[0][0]} tendencies, making you well-suited for {major} and related fields.",
-        "top_capabilities": [trait.title().replace('_', ' ') for trait, _ in top_traits],
-        "recommended_path": f"Consider career paths that leverage your {top_traits[0][0]} strengths in {major} field, such as research, analysis, or specialized roles.",
-        "strengths": f"Your strongest areas are {', '.join([trait.replace('_', ' ') for trait, _ in top_traits])}, which are valuable in today's competitive landscape.",
-        "growth_areas": [trait.title().replace('_', ' ') for trait, score in trait_scores.items() if score < 15],
-        "suggested_next_steps": [
-            f"Develop your {top_traits[0][0]} skills through relevant projects",
-            f"Explore career opportunities in {major} that match your profile",
-            "Build a portfolio showcasing your strongest capabilities"
-        ],
-        "confidence": "medium"
-    }
 
 # --- Quiz Endpoints ---
 
@@ -370,9 +424,10 @@ def fallback_conclusion(trait_scores, student_id=None):
 def generate_quiz():
     data = request.get_json()
     student_id = data.get("studentId")
+    # Always fetch the latest user profile for quiz generation
     user = users.find_one({"email": student_id})
     if not user:
-        return jsonify({"error": "Student not found"}), 404
+        return jsonify({"error": "Student not found."}), 404
     now = datetime.utcnow()
     quiz_doc = mongo.db.quizzes.find_one({
         "studentId": student_id,
@@ -383,19 +438,22 @@ def generate_quiz():
             "quizId": quiz_doc["quizId"],
             "questions": quiz_doc["questions"]
         }), 200
-    
-    # Generate quiz using LLM with fallback
-    quiz_json = call_llm_generate_quiz(user)
-    
-    # If LLM generation fails, use fallback
-    if not quiz_json:
-        print(f"LLM quiz generation failed for {student_id}, using fallback")
-        quiz_json = fallback_generate_quiz(user)
-    
-    # Final validation - ensure we have questions
-    if not quiz_json or not isinstance(quiz_json, list) or len(quiz_json) == 0:
-        return jsonify({"error": "Failed to generate quiz questions"}), 500
-    
+
+    # Give Gemini more time to generate before erroring out
+    print(f"Generating personalized quiz for {student_id} using their latest profile...")
+    quiz_json = None
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        quiz_json = call_llm_generate_quiz(user)
+        if quiz_json and isinstance(quiz_json, list) and (25 <= len(quiz_json) <= 30):
+            break
+        print(f"Quiz generation attempt {attempt+1} failed, retrying...")
+        time.sleep(3)  # Wait a bit longer between attempts
+
+    if not quiz_json or not isinstance(quiz_json, list) or not (25 <= len(quiz_json) <= 30):
+        print(f"Personalized quiz generation failed for {student_id} after {max_attempts} attempts.")
+        return jsonify({"error": "Failed to generate quiz questions. Please try again after some time."}), 500
+
     quiz_id = str(uuid.uuid4())
     mongo.db.quizzes.insert_one({
         "studentId": student_id,
@@ -418,7 +476,7 @@ def submit_quiz():
     quiz_doc = mongo.db.quizzes.find_one({"quizId": quiz_id, "studentId": student_id})
     if not quiz_doc:
         return jsonify({"error": "Quiz not found"}), 404
-    
+
     trait_scores = {t: 0 for t in TRAITS}
     for q in quiz_doc["questions"]:
         qid = q["id"]
@@ -427,20 +485,19 @@ def submit_quiz():
         if opt:
             for t, v in opt["weights"].items():
                 trait_scores[t] += v
-    
+
     mongo.db.quiz_answers.insert_one({
         "studentId": student_id,
         "quizId": quiz_id,
         "answers": answers,
         "submittedAt": datetime.utcnow()
     })
-    
-    # Try AI conclusion first
+
+    # Only use LLM for analysis, no fallback
     conclusion_json = call_llm_conclusion(student_id, trait_scores)
     if not conclusion_json:
-        # Use enhanced fallback
-        conclusion_json = fallback_conclusion(trait_scores, student_id)
-    
+        return jsonify({"error": "Failed to generate analysis"}), 500
+
     mongo.db.quiz_results.insert_one({
         "studentId": student_id,
         "quizId": quiz_id,
