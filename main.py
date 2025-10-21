@@ -522,8 +522,8 @@ def get_quiz_result():
 def signup():
     data = request.get_json()
 
-    # Only email and password are required for signup
-    required = ["email", "password"]
+    # Required fields for signup
+    required = ["email", "password", "name", "institutionType", "institutionName"]
 
     if not all(data.get(f) for f in required):
         return jsonify({"message": "Missing required fields."}), 400
@@ -534,20 +534,54 @@ def signup():
 
     # Hash the password
     hashed_pw = generate_password_hash(data["password"])
+    
+    # Normalize institution type to studentType
+    student_type = data["institutionType"].lower()  # "school" or "college"
 
-    # Create minimal user object - only email and password
-    # All other fields will be added during onboarding
+    # Create complete user object with profile data
     user_doc = {
         "email": data["email"],
         "password": hashed_pw,
-        "isOnboardingComplete": False,  # Flag to track onboarding status
-        "createdAt": datetime.utcnow()
+        "name": data["name"],
+        "institute": data["institutionName"],
+        "studentType": student_type,
+        "isOnboardingComplete": True,  # User completed profile during signup
+        "createdAt": datetime.utcnow(),
+        "onboardingCompletedAt": datetime.utcnow()
     }
+    
+    # Add class or major field based on institution type
+    if student_type == "college":
+        user_doc["major"] = ""  # Will be filled later
+        user_doc["year"] = ""  # Will be filled later
+    else:
+        user_doc["class"] = ""  # Will be filled later
 
     # Insert into MongoDB
     users.insert_one(user_doc)
+    
+    # Generate JWT token to automatically log them in
+    token = jwt.encode(
+        {
+            'email': data["email"],
+            'exp': datetime.utcnow() + timedelta(days=7)
+        },
+        app.secret_key,
+        algorithm='HS256'
+    )
+    
+    print(f"✅ New user signed up: {data['email']} ({student_type})")
 
-    return jsonify({"message": "User registered successfully"}), 201
+    return jsonify({
+        "message": "User registered successfully",
+        "token": token,
+        "user": {
+            "email": data["email"],
+            "name": data["name"],
+            "studentType": student_type,
+            "isOnboardingComplete": True
+        }
+    }), 201
 
 # LOGIN ROUTE
 @app.route("/login", methods=["POST"])
