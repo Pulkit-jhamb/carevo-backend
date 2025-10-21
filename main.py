@@ -97,7 +97,7 @@ load_dotenv()
 # Create Flask app
 app = Flask(__name__)
 
-CORS(app, origins="*", supports_credentials=True, allow_headers=["*"], methods=["GET", "POST", "PATCH", "OPTIONS"])
+CORS(app, origins="*", supports_credentials=True, allow_headers=["*"], methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"])
 
 # Configure MongoDB
 app.config["MONGO_URI"] = os.getenv("MONGO_URI")
@@ -522,22 +522,11 @@ def get_quiz_result():
 def signup():
     data = request.get_json()
 
-    # Universal required fields
-    required = ["email", "password", "name", "institute", "dob", "studentType"]
+    # Only email and password are required for signup
+    required = ["email", "password"]
 
     if not all(data.get(f) for f in required):
         return jsonify({"message": "Missing required fields."}), 400
-
-    # Validate studentType-specific required fields
-    if data["studentType"] == "school":
-        if not data.get("class"):
-            return jsonify({"message": "Missing 'class' for school student."}), 400
-    elif data["studentType"] == "college":
-        for f in ["degree", "major", "year"]:
-            if not data.get(f):
-                return jsonify({"message": f"Missing '{f}' for college student."}), 400
-    else:
-        return jsonify({"message": "Invalid student type."}), 400
 
     # Check if user already exists
     if users.find_one({"email": data["email"]}):
@@ -546,25 +535,14 @@ def signup():
     # Hash the password
     hashed_pw = generate_password_hash(data["password"])
 
-    # Construct full user object
+    # Create minimal user object - only email and password
+    # All other fields will be added during onboarding
     user_doc = {
         "email": data["email"],
         "password": hashed_pw,
-        "name": data["name"],
-        "institute": data["institute"],
-        "dob": data["dob"],
-        "studentType": data["studentType"]
+        "isOnboardingComplete": False,  # Flag to track onboarding status
+        "createdAt": datetime.utcnow()
     }
-
-    # Add role-specific fields
-    if data["studentType"] == "school":
-        user_doc["class"] = data["class"]
-    elif data["studentType"] == "college":
-        user_doc.update({
-            "degree": data["degree"],
-            "major": data["major"],
-            "year": data["year"]
-        })
 
     # Insert into MongoDB
     users.insert_one(user_doc)
@@ -593,19 +571,96 @@ def login():
             algorithm='HS256'
         )
         
-        # Return token in response body (NO COOKIES!)
+        # Determine if user needs onboarding or can go to dashboard
+        isOnboardingComplete = user.get("isOnboardingComplete", False)
+        
+        # For existing users who don't have the flag, check if they have profile data
+        if isOnboardingComplete is False and not user.get("isOnboardingComplete"):
+            # Check if user has profile data (legacy users)
+            hasProfileData = bool(
+                user.get("name") or 
+                user.get("institute") or 
+                user.get("class") or 
+                user.get("year") or 
+                user.get("major") or
+                user.get("studentType")
+            )
+            isOnboardingComplete = hasProfileData
+        
+        # Determine user type for dashboard routing
+        userType = "school"  # default
+        if user.get("year") and not user.get("class"):
+            userType = "college"
+        elif user.get("major"):
+            userType = "college"
+        elif user.get("institute") and "college" in user.get("institute", "").lower():
+            userType = "college"
+        elif user.get("studentType") == "college":
+            userType = "college"
+        
+        # Return token and user info
         return jsonify({
             "message": "Login successful",
-            "token": token,  # 🚨 THIS IS THE KEY CHANGE - send token in response
+            "token": token,
             "user": {
                 "email": email,
                 "name": user.get("name"),
-                "studentType": user.get("studentType")
+                "studentType": userType,
+                "isOnboardingComplete": isOnboardingComplete
             }
         }), 200
     
     return jsonify({"message": "Invalid credentials"}), 401
 
+
+# ONBOARDING COMPLETE AUTHENTICATION
+@app.route("/auth/onboarding-complete", methods=["POST"])
+def onboarding_complete_auth():
+    data = request.get_json()
+    email = data.get("email")
+    
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+    
+    user = users.find_one({"email": email})
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
+    # Check if onboarding is actually complete
+    if not user.get("isOnboardingComplete", False):
+        return jsonify({"error": "Onboarding not complete"}), 400
+    
+    # Create JWT token for the authenticated user
+    token = jwt.encode(
+        {
+            'email': email,
+            'exp': datetime.utcnow() + timedelta(days=7)
+        },
+        app.secret_key,
+        algorithm='HS256'
+    )
+    
+    # Determine user type for dashboard routing
+    userType = "school"  # default
+    if user.get("year") and not user.get("class"):
+        userType = "college"
+    elif user.get("major"):
+        userType = "college"
+    elif user.get("institute") and "college" in user.get("institute", "").lower():
+        userType = "college"
+    elif user.get("studentType") == "college":
+        userType = "college"
+    
+    return jsonify({
+        "message": "Authentication successful",
+        "token": token,
+        "user": {
+            "email": email,
+            "name": user.get("name"),
+            "studentType": userType,
+            "isOnboardingComplete": True
+        }
+    }), 200
 
 # LOGOUT ROUTE
 @app.route("/logout", methods=["POST"])
@@ -709,24 +764,47 @@ def ai():
 def update_user():
     data = request.get_json()
     email = data.get("email")
+    
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+    
     update_fields = {}
 
-    # Update basic fields
-    for field in ["conclusion", "recommendations", "quiz_result"]:
+    # Update onboarding fields (updated format)
+    onboarding_fields = [
+        "preferred_theme", "name", "instituteName", "year", "preferred_language", 
+        "school_or_college", "course"
+    ]
+    
+    for field in onboarding_fields:
         if field in data:
             update_fields[field] = data[field]
 
-    # Add other fields as needed...
+    # Update other existing fields
+    other_fields = [
+        "conclusion", "recommendations", "quiz_result", "institute", 
+        "theme", "plan", "category", "language", "class", "major", "studentType"
+    ]
+    
+    for field in other_fields:
+        if field in data:
+            update_fields[field] = data[field]
 
-    if not email or not update_fields:
-        return jsonify({"error": "Missing email or fields to update"}), 400
+    # If this is an onboarding completion, mark it as complete
+    if any(field in onboarding_fields for field in update_fields.keys()):
+        update_fields["isOnboardingComplete"] = True
+        update_fields["onboardingCompletedAt"] = datetime.utcnow()
+
+    if not update_fields:
+        return jsonify({"error": "No fields to update"}), 400
 
     result = users.update_one(
         {"email": email},
         {"$set": update_fields}
     )
+    
     if result.matched_count:
-        return jsonify({"message": "User updated"}), 200
+        return jsonify({"message": "User updated successfully", "updated_fields": list(update_fields.keys())}), 200
     return jsonify({"error": "User not found"}), 404
 
 @app.route("/user/cgpa", methods=["PATCH"])
@@ -1346,6 +1424,318 @@ def get_study_plan():
         "tasks": tasks
     })
 
+
+# --- Projects Management Endpoints ---
+
+@app.route("/user/projects", methods=["GET"])
+def get_projects():
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    user = users.find_one({"email": email}, {"_id": 0, "projects": 1})
+    projects = user.get("projects", []) if user else []
+    return jsonify({"projects": projects}), 200
+
+@app.route("/user/projects", methods=["POST"])
+def add_project():
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    data = request.get_json()
+    project = {
+        "id": str(uuid.uuid4()),
+        "title": data.get("title", ""),
+        "link": data.get("link", ""),
+        "createdAt": datetime.utcnow().isoformat()
+    }
+    
+    result = users.update_one(
+        {"email": email},
+        {"$push": {"projects": project}}
+    )
+    
+    if result.matched_count:
+        return jsonify({"message": "Project added", "project": project}), 201
+    return jsonify({"error": "User not found"}), 404
+
+@app.route("/user/projects/<project_id>", methods=["DELETE"])
+def delete_project(project_id):
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    result = users.update_one(
+        {"email": email},
+        {"$pull": {"projects": {"id": project_id}}}
+    )
+    
+    if result.matched_count:
+        return jsonify({"message": "Project deleted"}), 200
+    return jsonify({"error": "Project not found"}), 404
+
+# --- Work Experience Management Endpoints ---
+
+@app.route("/user/work-experience", methods=["GET"])
+def get_work_experience():
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    user = users.find_one({"email": email}, {"_id": 0, "workExperience": 1})
+    work_experience = user.get("workExperience", []) if user else []
+    return jsonify({"workExperience": work_experience}), 200
+
+@app.route("/user/work-experience", methods=["POST"])
+def add_work_experience():
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    data = request.get_json()
+    experience = {
+        "id": str(uuid.uuid4()),
+        "title": data.get("title", ""),
+        "link": data.get("link", ""),
+        "certificate": data.get("certificate", ""),
+        "createdAt": datetime.utcnow().isoformat()
+    }
+    
+    result = users.update_one(
+        {"email": email},
+        {"$push": {"workExperience": experience}}
+    )
+    
+    if result.matched_count:
+        return jsonify({"message": "Work experience added", "experience": experience}), 201
+    return jsonify({"error": "User not found"}), 404
+
+@app.route("/user/work-experience/<experience_id>", methods=["DELETE"])
+def delete_work_experience(experience_id):
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    result = users.update_one(
+        {"email": email},
+        {"$pull": {"workExperience": {"id": experience_id}}}
+    )
+    
+    if result.matched_count:
+        return jsonify({"message": "Work experience deleted"}), 200
+    return jsonify({"error": "Work experience not found"}), 404
+
+# --- Events Management Endpoints ---
+
+@app.route("/user/events", methods=["GET"])
+def get_events():
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    user = users.find_one({"email": email}, {"_id": 0, "events": 1})
+    events = user.get("events", []) if user else []
+    return jsonify({"events": events}), 200
+
+@app.route("/user/events", methods=["POST"])
+def add_event():
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    data = request.get_json()
+    event = {
+        "id": str(uuid.uuid4()),
+        "title": data.get("title", ""),
+        "date": data.get("date", ""),
+        "time": data.get("time", ""),
+        "description": data.get("description", ""),
+        "createdAt": datetime.utcnow().isoformat()
+    }
+    
+    result = users.update_one(
+        {"email": email},
+        {"$push": {"events": event}}
+    )
+    
+    if result.matched_count:
+        return jsonify({"message": "Event added", "event": event}), 201
+    return jsonify({"error": "User not found"}), 404
+
+@app.route("/user/events/<event_id>", methods=["DELETE"])
+def delete_event(event_id):
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    result = users.update_one(
+        {"email": email},
+        {"$pull": {"events": {"id": event_id}}}
+    )
+    
+    if result.matched_count:
+        return jsonify({"message": "Event deleted"}), 200
+    return jsonify({"error": "Event not found"}), 404
+
+# --- CGPA/Semester Management Endpoints ---
+
+@app.route("/user/semesters", methods=["GET"])
+def get_semesters():
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    user = users.find_one({"email": email}, {"_id": 0, "semesters": 1})
+    semesters = user.get("semesters", []) if user else []
+    
+    # Calculate overall CGPA
+    total_credits = sum(sem.get("credits", 0) for sem in semesters)
+    total_grade_points = sum(sem.get("sgpa", 0) * sem.get("credits", 0) for sem in semesters)
+    overall_cgpa = round(total_grade_points / total_credits, 2) if total_credits > 0 else 0.0
+    
+    return jsonify({
+        "semesters": semesters,
+        "overall_cgpa": overall_cgpa,
+        "total_credits": total_credits
+    }), 200
+
+@app.route("/user/semesters", methods=["POST"])
+def add_semester():
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    data = request.get_json()
+    semester = {
+        "id": str(uuid.uuid4()),
+        "semester_number": data.get("semester_number", 1),
+        "sgpa": float(data.get("sgpa", 0)),
+        "credits": int(data.get("credits", 0)),
+        "createdAt": datetime.utcnow().isoformat()
+    }
+    
+    result = users.update_one(
+        {"email": email},
+        {"$push": {"semesters": semester}}
+    )
+    
+    if result.matched_count:
+        return jsonify({"message": "Semester added", "semester": semester}), 201
+    return jsonify({"error": "User not found"}), 404
+
+@app.route("/user/semesters/<semester_id>", methods=["DELETE"])
+def delete_semester(semester_id):
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "No authentication token"}), 401
+    
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+        email = payload['email']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid token"}), 401
+    
+    result = users.update_one(
+        {"email": email},
+        {"$pull": {"semesters": {"id": semester_id}}}
+    )
+    
+    if result.matched_count:
+        return jsonify({"message": "Semester deleted"}), 200
+    return jsonify({"error": "Semester not found"}), 404
+
+# --- Current Date/Time Endpoint ---
+
+@app.route("/current-date", methods=["GET"])
+def get_current_date():
+    now = datetime.now()
+    return jsonify({
+        "date": now.day,
+        "month": now.strftime("%B"),
+        "year": now.year,
+        "weekday": now.strftime("%A"),
+        "full_date": now.strftime("%Y-%m-%d"),
+        "formatted_date": now.strftime("%A, %d %B")
+    }), 200
 
 if __name__ == "__main__":
     app.run(debug=True , port=5001 , host="0.0.0.0")
